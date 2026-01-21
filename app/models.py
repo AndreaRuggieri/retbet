@@ -13,6 +13,8 @@ from sqlalchemy import (
     UniqueConstraint,
     JSON,
 )
+from sqlalchemy import Date, UniqueConstraint
+
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .db import Base
@@ -81,13 +83,18 @@ class Player(Base):
     macro_role: Mapped[Optional[str]] = mapped_column(String, nullable=True)     # GK/DF/MF/ST
     micro_roles: Mapped[List[str]] = mapped_column(JSON, default=list)          # ✅ callable
 
-    current_team_id: Mapped[Optional[int]] = mapped_column(ForeignKey("teams.id"), nullable=True)
+    # current_team_id: Mapped[Optional[int]] = mapped_column(ForeignKey("teams.id"), nullable=True)
     jersey_number: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
     extras: Mapped[Dict] = mapped_column(JSON, default=dict)  # ✅ callable
 
     country: Mapped[Optional["Country"]] = relationship()
-    current_team: Mapped[Optional["Team"]] = relationship()
+    current_team_season_id: Mapped[int | None] = mapped_column(
+        ForeignKey("team_seasons.id"), nullable=True
+    )
+
+    current_team_season: Mapped["TeamSeason | None"] = relationship()
+
 
 
 # -----------------------------
@@ -174,3 +181,19 @@ class Card(Base):
     match: Mapped["Match"] = relationship("Match", back_populates="cards")
     team: Mapped["Team"] = relationship()
     player: Mapped[Optional["Player"]] = relationship()
+
+
+class TeamSeason(Base):
+    __tablename__ = "team_seasons"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+
+    team_id: Mapped[int] = mapped_column(ForeignKey("teams.id"), nullable=False)
+    season_id: Mapped[int] = mapped_column(ForeignKey("seasons.id"), nullable=False)
+
+    team: Mapped["Team"] = relationship()
+    season: Mapped["Season"] = relationship()
+
+    __table_args__ = (
+        UniqueConstraint("team_id", "season_id", name="uq_team_season"),
+    )

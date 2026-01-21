@@ -2,7 +2,6 @@ import sys
 from pathlib import Path
 from datetime import date
 from sqlalchemy.exc import IntegrityError
-
 import streamlit as st
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -10,7 +9,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app.db import SessionLocal, engine
-from app.models import Base, Team, Player, Country
+from app.models import Base, Competition, Season, Team, TeamSeason, Player, Country
 
 Base.metadata.create_all(bind=engine)
 db = SessionLocal()
@@ -22,6 +21,7 @@ MACRO = ["GK", "DF", "MF", "ST"]
 MICRO = ["GK", "LB", "RB", "CB", "DM", "CM", "AM", "LM", "RM", "CF", "SS", "LW", "LF", "RW", "RF"]
 
 
+# ---------------- Helpers ----------------
 def get_or_create(model, **kwargs):
     obj = db.query(model).filter_by(**kwargs).first()
     if obj:
@@ -36,7 +36,6 @@ def get_or_create(model, **kwargs):
 def get_or_create_country(name: str, code: str):
     name = (name or "").strip()
     code = (code or "").strip().upper()
-
     if not name or not code:
         return None
 
@@ -96,7 +95,7 @@ def reset_name_fields_only():
     st.session_state["full_name_val"] = ""
 
 
-def submit_player(team_id: int):
+def submit_player(team_season_id: int):
     first_name = (st.session_state.get("first_name_val") or "").strip()
     last_name = (st.session_state.get("last_name_val") or "").strip()
     full_name = (st.session_state.get("full_name_val") or "").strip() or None
@@ -116,7 +115,6 @@ def submit_player(team_id: int):
 
     if country_name_in and country_code_in:
         country_obj = get_or_create_country(country_name_in, country_code_in)
-        # reset campi manuali (evita ricreazioni/ri-click)
         st.session_state["country_code_val"] = ""
         st.session_state["country_name_val"] = ""
 
@@ -126,10 +124,12 @@ def submit_player(team_id: int):
         return
     st.session_state["form_error"] = ""
 
+    # regola: se esiste già stesso Nome+Cognome+Data -> update di quel record
     existing = db.query(Player).filter(
         Player.first_name == first_name,
         Player.last_name == last_name,
         Player.birth_date == birth_date,
+        Player.current_team_season_id == team_season_id,  # <-- importante: stesso contesto
     ).first()
 
     age_years = compute_age_years(birth_date)
@@ -140,7 +140,7 @@ def submit_player(team_id: int):
         existing.country_id = country_obj.id if country_obj else None
         existing.macro_role = macro_role
         existing.micro_roles = micro_roles
-        existing.current_team_id = team_id
+        existing.current_team_season_id = team_season_id
         existing.age_years = age_years
         db.commit()
     else:
@@ -153,7 +153,7 @@ def submit_player(team_id: int):
             country_id=country_obj.id if country_obj else None,
             macro_role=macro_role,
             micro_roles=micro_roles,
-            current_team_id=team_id,
+            current_team_season_id=team_season_id,
             jersey_number=jersey,
         )
         db.add(newp)
@@ -176,7 +176,6 @@ if "macro_val" not in st.session_state:
 if "micro_val" not in st.session_state:
     st.session_state["micro_val"] = []
 
-# ora è int (0 = nessuno)
 if "country_pick_val" not in st.session_state:
     st.session_state["country_pick_val"] = 0
 if "country_code_val" not in st.session_state:
@@ -195,44 +194,141 @@ if "form_error" not in st.session_state:
     st.session_state["form_error"] = ""
 
 
-# ---------------- Sidebar: setup rapido ----------------
+# ---------------- Sidebar: Setup rapido ----------------
 with st.sidebar:
     st.header("Setup rapido")
 
-    st.subheader("Aggiungi Team")
-    t_name = st.text_input("Nome squadra", key="tname", placeholder="Milan")
-    if st.button("➕ Crea squadra"):
+    st.subheader("Aggiungi Club (Team)")
+    t_name = st.text_input("Nome club", key="tname", placeholder="Atalanta")
+    if st.button("➕ Crea club"):
         if t_name.strip():
             get_or_create(Team, name=t_name.strip())
-            st.success("Squadra aggiunta")
+            st.success("Club aggiunto")
         else:
-            st.warning("Inserisci nome squadra")
+            st.warning("Inserisci nome club")
+
+    st.divider()
+    st.subheader("Assegna club a Stagione (TeamSeason)")
+    st.caption("Qui definisci: Atalanta in Serie A 2025-2026")
+
+    comps_sb = db.query(Competition).order_by(Competition.name).all()
+
+    comp_id_sb = st.selectbox(
+        "Competizione",
+        [c.id for c in comps_sb] if comps_sb else [],
+        format_func=lambda cid: next((c.name for c in comps_sb if c.id == cid), "—"),
+        key="sb_comp_id",
+    )
+
+    seasons_sb = (
+        db.query(Season)
+        .filter(Season.competition_id == comp_id_sb)
+        .order_by(Season.name)
+        .all()
+    ) if comp_id_sb else []
+
+    season_id_sb = st.selectbox(
+        "Stagione",
+        [s.id for s in seasons_sb] if seasons_sb else [],
+        format_func=lambda sid: next((s.name for s in seasons_sb if s.id == sid), "—"),
+        key="sb_season_id",
+    )
+
+    # oggetti veri (solo se ti servono)
+    season_sb = db.query(Season).get(season_id_sb) if season_id_sb else None
+
+
+    teams_sb = db.query(Team).order_by(Team.name).all()
+    team_sb = st.selectbox("Club", teams_sb, format_func=lambda t: t.name, key="sb_team") if teams_sb else None
+
+    if st.button("➕ Aggiungi squadra a questa stagione"):
+        if not (season_id_sb and team_sb):
+            st.error("Seleziona Stagione e Club.")
+        else:
+            existing_ts = db.query(TeamSeason).filter_by(team_id=team_sb.id, season_id=season_id_sb).first()
+            if existing_ts:
+                st.info("Esiste già questa squadra in questa stagione.")
+            else:
+                ts = TeamSeason(team_id=team_sb.id, season_id=season_id_sb)
+                db.add(ts)
+                db.commit()
+                st.success("Squadra aggiunta alla stagione.")
+
+
 
 st.divider()
 
-# ---------------- Selezione squadra ----------------
-teams = db.query(Team).order_by(Team.name).all()
-if not teams:
-    st.info("Aggiungi almeno una squadra dalla sidebar.")
+# ---------------- Selettori principali: Competition -> Season -> TeamSeason ----------------
+comps = db.query(Competition).order_by(Competition.name).all()
+if not comps:
+    st.info("Prima crea almeno una Competizione/Stagione (nella UI match o da DB).")
     st.stop()
 
-team_options = {t.name: t.id for t in teams}
-team_name = st.selectbox("Seleziona squadra (rosa)", list(team_options.keys()))
-team_id = team_options[team_name]
-team = db.query(Team).get(team_id)
+comps = db.query(Competition).order_by(Competition.name).all()
+if not comps:
+    st.info("Prima crea almeno una Competizione/Stagione.")
+    st.stop()
 
-# ---------------- Lista giocatori squadra + ricerca ----------------
-colA, colB, colC = st.columns([2, 1, 1])
+comp_id = st.selectbox(
+    "Competizione",
+    [c.id for c in comps],
+    format_func=lambda cid: next((c.name for c in comps if c.id == cid), "—"),
+    key="main_comp_id",
+)
+
+seasons = (
+    db.query(Season)
+    .filter(Season.competition_id == comp_id)
+    .order_by(Season.name)
+    .all()
+)
+if not seasons:
+    st.info("Nessuna stagione per questa competizione.")
+    st.stop()
+
+season_id = st.selectbox(
+    "Stagione",
+    [s.id for s in seasons],
+    format_func=lambda sid: next((s.name for s in seasons if s.id == sid), "—"),
+    key="main_season_id",
+)
+
+team_seasons = (
+    db.query(TeamSeason)
+    .filter(TeamSeason.season_id == season_id)
+    .all()
+)
+if not team_seasons:
+    st.info("Nessuna squadra registrata per questa stagione. Usa la sidebar per aggiungerla.")
+    st.stop()
+
+team_season_id = st.selectbox(
+    "Squadra (in questa stagione)",
+    [ts.id for ts in team_seasons],
+    format_func=lambda tsid: next((ts.team.name for ts in team_seasons if ts.id == tsid), "—"),
+    key="main_team_season_id",
+)
+
+# ricarico oggetti veri (se ti servono per caption)
+comp = db.query(Competition).get(comp_id)
+season = db.query(Season).get(season_id)
+team_season = db.query(TeamSeason).get(team_season_id)
+
+st.caption(f"Vista corrente: **{comp.name}** · **{season.name}** · **{team_season.team.name}**")
+
+
+st.caption(f"Vista corrente: **{comp.name}** · **{season.name}** · **{team_season.team.name}**")
+
+# ---------------- Lista giocatori di quella TeamSeason ----------------
+colA, colB = st.columns([2, 1])
 with colA:
     search = st.text_input("Cerca (cognome/nome/full name)", placeholder="es: Leao / Lautaro / Rafael Leão")
 with colB:
-    show_all = st.checkbox("Mostra tutti (anche altre squadre)", value=False)
-with colC:
-    st.write("")  # spacer
+    show_all = st.checkbox("Mostra tutti (ignora stagione/squadra)", value=False)
 
 q = db.query(Player)
 if not show_all:
-    q = q.filter(Player.current_team_id == team_id)
+    q = q.filter(Player.current_team_season_id == team_season_id)
 
 if search.strip():
     s = f"%{search.strip()}%"
@@ -244,11 +340,11 @@ if search.strip():
 
 players = q.order_by(Player.last_name, Player.first_name).all()
 
-st.subheader(f"📋 Giocatori (vista: {team.name})")
+st.subheader("📋 Giocatori")
 
-# layout righe: Nome | Squadra | Nat | DoB | Age | Macro | Micro | ✏️ | ❌
+# layout righe: Nome | Squadra | Stagione | Nat | DoB | Age | Macro | Micro | ✏️ | ❌
 for p in players:
-    cols = st.columns([2.6, 1.4, 0.8, 1.3, 0.6, 0.8, 2.8, 0.5, 0.5])
+    cols = st.columns([2.6, 1.4, 1.2, 0.8, 1.3, 0.6, 0.8, 2.8, 0.5, 0.5])
 
     with cols[0]:
         display = f"{p.last_name} {p.first_name}".strip()
@@ -257,27 +353,37 @@ for p in players:
         st.write(display)
 
     with cols[1]:
-        st.write(p.current_team.name if getattr(p, "current_team", None) else "")
+        # squadra = p.current_team_season.team.name
+        try:
+            st.write(p.current_team_season.team.name if p.current_team_season else "")
+        except Exception:
+            st.write("")
 
     with cols[2]:
-        st.write(p.country.code if p.country else "")
+        try:
+            st.write(p.current_team_season.season.name if p.current_team_season else "")
+        except Exception:
+            st.write("")
 
     with cols[3]:
-        st.write(p.birth_date.strftime("%d/%m/%Y") if p.birth_date else "")
+        st.write(p.country.code if p.country else "")
 
     with cols[4]:
-        st.write(p.age_years if p.age_years is not None else "")
+        st.write(p.birth_date.strftime("%d/%m/%Y") if p.birth_date else "")
 
     with cols[5]:
-        st.write(p.macro_role or "")
+        st.write(p.age_years if p.age_years is not None else "")
 
     with cols[6]:
-        st.write(", ".join(p.micro_roles or []))
+        st.write(p.macro_role or "")
 
     with cols[7]:
-        st.button("✏️", key=f"edit_btn_{p.id}", on_click=start_edit, args=(p.id,))
+        st.write(", ".join(p.micro_roles or []))
 
     with cols[8]:
+        st.button("✏️", key=f"edit_btn_{p.id}", on_click=start_edit, args=(p.id,))
+
+    with cols[9]:
         if st.button("❌", key=f"del_btn_{p.id}"):
             st.session_state["delete_player_id"] = p.id
             st.session_state["delete_player_name"] = f"{p.last_name} {p.first_name}"
@@ -297,13 +403,10 @@ if st.session_state.get("delete_player_id") is not None:
                 if obj:
                     db.delete(obj)
                     db.commit()
-
                 st.session_state["delete_player_id"] = None
                 st.session_state["delete_player_name"] = None
-
                 if st.session_state.get("edit_player_id") == pid:
                     st.session_state["edit_player_id"] = None
-
                 st.rerun()
         with c2:
             if st.button("No"):
@@ -319,7 +422,7 @@ st.subheader("➕ Inserisci / Modifica giocatore")
 if st.session_state["edit_player_id"] is not None:
     st.info(
         f"✏️ Modalità modifica attiva (Player ID={st.session_state['edit_player_id']}). "
-        "Premi 'Crea giocatore' per sovrascrivere (match su Nome+Cognome+Data)."
+        "Premi 'Crea giocatore' per sovrascrivere (match su Nome+Cognome+Data **nella stessa squadra/stagione**)."
     )
 
 countries = db.query(Country).order_by(Country.name).all()
@@ -366,5 +469,5 @@ st.button(
     "💾 Crea giocatore",
     type="primary",
     on_click=submit_player,
-    args=(team_id,)
+    args=(team_season_id,),
 )
